@@ -1,6 +1,7 @@
 import json
 import random
 import time
+from urllib.parse import quote
 from collections import Counter
 from datetime import datetime
 
@@ -189,6 +190,7 @@ def maybe_advance_simulation() -> None:
 def speak_feedback_once(text: str, event_idx: int) -> None:
     safe_text = json.dumps(text)
     html = f"""
+    <html><body>
     <script>
     const text = {safe_text};
     if ('speechSynthesis' in window) {{
@@ -200,8 +202,12 @@ def speak_feedback_once(text: str, event_idx: int) -> None:
         window.speechSynthesis.speak(utter);
     }}
     </script>
+    <!-- event:{event_idx} -->
+    </body></html>
     """
-    st.html(html, unsafe_allow_javascript=True)
+    # Use iframe with a tiny positive height so script executes on every new event.
+    data_url = f"data:text/html;charset=utf-8,{quote(html)}"
+    st.iframe(data_url, height=1, width="content")
     st.session_state.last_spoken_event_idx = event_idx
 
 
