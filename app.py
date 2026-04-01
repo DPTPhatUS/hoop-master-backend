@@ -188,7 +188,7 @@ def maybe_advance_simulation() -> None:
 
 def speak_feedback_once(text: str, event_idx: int) -> None:
     safe_text = json.dumps(text)
-    script = f"""
+    html = f"""
     <script>
     const text = {safe_text};
     if ('speechSynthesis' in window) {{
@@ -201,7 +201,7 @@ def speak_feedback_once(text: str, event_idx: int) -> None:
     }}
     </script>
     """
-    st.components.v1.html(script, height=0)
+    st.html(html, unsafe_allow_javascript=True)
     st.session_state.last_spoken_event_idx = event_idx
 
 
@@ -247,7 +247,7 @@ def render_summary() -> None:
             }
             for event in events
         ],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -258,7 +258,7 @@ def main() -> None:
 
     st.title("Hoop Master: Basketball Throw Form Assistant (Hi-Fi Prototype)")
     st.caption(
-        "Simulation mode: live video capture + randomized feedback every 3 seconds for 30 seconds."
+        f"Simulation mode: live video capture + randomized feedback every {THROW_INTERVAL_SECONDS} seconds for {SESSION_DURATION_SECONDS} seconds."
     )
 
     st.session_state.mute_audio = st.toggle(
@@ -281,7 +281,7 @@ def main() -> None:
             st.info("Click START in the video box to enable your live camera.")
 
     control_col1, control_col2, control_col3 = st.columns(3)
-    if control_col1.button("Start Session", use_container_width=True):
+    if control_col1.button("Start Session", width="stretch"):
         if not camera_live:
             st.warning("Enable live camera first, then start the session.")
         elif not st.session_state.session_active:
@@ -291,13 +291,13 @@ def main() -> None:
             st.session_state.rng_seed = int(st.session_state.session_start_ts)
             st.rerun()
 
-    if control_col2.button("Stop Session", use_container_width=True):
+    if control_col2.button("Stop Session", width="stretch"):
         if st.session_state.session_active:
             st.session_state.session_active = False
             st.session_state.session_completed = True
             st.session_state.session_end_ts = time.time()
 
-    if control_col3.button("Reset", use_container_width=True):
+    if control_col3.button("Reset", width="stretch"):
         reset_session()
 
     if st.session_state.session_active:
@@ -370,7 +370,7 @@ def main() -> None:
                     for event in st.session_state.throw_events[-5:]
                 ],
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
 
             latest_idx = latest_event["idx"]
