@@ -5,7 +5,7 @@ It is intentionally a prototype workflow (not real pose estimation).
 
 ## What It Simulates
 
-1. Camera capture of user shooting form (still image).
+1. Live camera capture of user shooting form (video stream).
 2. Predefined common shooting-form mistakes.
 3. Live processing simulation every 3 seconds with randomized outcomes:
 	- A detected mistake, or
@@ -19,6 +19,7 @@ It is intentionally a prototype workflow (not real pose estimation).
 - Python 3.11+
 - Streamlit
 - streamlit-autorefresh
+- streamlit-webrtc
 - uv for package management and execution
 
 ## Run With uv
@@ -34,9 +35,9 @@ Then open the local Streamlit URL in your browser.
 
 ## Demo Flow
 
-1. Capture an image using the camera input widget.
+1. Turn on webcam live stream by clicking START in the video panel.
 2. Click Start Session.
-3. The app creates one simulated throw event every 3 seconds.
+3. The app creates one simulated throw event every 3 seconds while you perform throws.
 4. Each event shows:
 	- Detected issue (or no issue),
 	- Coaching feedback text,
@@ -47,6 +48,6 @@ Then open the local Streamlit URL in your browser.
 
 ## Notes
 
-- Highlighted mistake regions are simulated overlays and not computer vision output.
+- Highlighted mistake regions are simulated guidance and not computer vision output.
 - Browser permission is required for camera access.
 - Browser support is required for the Web Speech API used for text-to-speech.

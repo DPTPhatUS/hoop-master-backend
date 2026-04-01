@@ -1,4 +1,3 @@
-import io
 import json
 import random
 import time
@@ -6,11 +5,11 @@ from collections import Counter
 from datetime import datetime
 
 import streamlit as st
-from PIL import Image, ImageDraw
 from streamlit_autorefresh import st_autorefresh
+from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
-THROW_INTERVAL_SECONDS = 3
-SESSION_DURATION_SECONDS = 30
+THROW_INTERVAL_SECONDS = 10
+SESSION_DURATION_SECONDS = 60
 MAX_POINTS_PER_THROW = 10
 NO_MISTAKE_WEIGHT = 0.35
 
@@ -97,23 +96,8 @@ MISTAKES = [
     },
 ]
 
-TARGET_BOXES = {
-    "EYES": (0.42, 0.08, 0.58, 0.2),
-    "SHOULDERS": (0.3, 0.22, 0.7, 0.38),
-    "ELBOW": (0.55, 0.32, 0.75, 0.55),
-    "GUIDE HAND": (0.28, 0.3, 0.48, 0.56),
-    "WRIST": (0.6, 0.45, 0.78, 0.68),
-    "BALL POCKET": (0.42, 0.3, 0.62, 0.5),
-    "RELEASE": (0.45, 0.02, 0.72, 0.24),
-    "TRAJECTORY": (0.15, 0.02, 0.85, 0.25),
-    "FEET": (0.3, 0.74, 0.72, 0.98),
-    "LANDING": (0.18, 0.74, 0.85, 0.98),
-}
-
-
 def init_state() -> None:
     defaults = {
-        "captured_image": None,
         "session_active": False,
         "session_completed": False,
         "session_start_ts": None,
@@ -202,26 +186,6 @@ def maybe_advance_simulation() -> None:
         st.session_state.session_end_ts = now
 
 
-def draw_target_box(image_bytes: bytes, target: str) -> Image.Image:
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    draw = ImageDraw.Draw(image)
-
-    box = TARGET_BOXES.get(target)
-    if not box:
-        return image
-
-    width, height = image.size
-    x1 = int(box[0] * width)
-    y1 = int(box[1] * height)
-    x2 = int(box[2] * width)
-    y2 = int(box[3] * height)
-
-    draw.rectangle([x1, y1, x2, y2], outline="red", width=max(3, width // 150))
-    draw.rectangle([x1, max(0, y1 - 28), x1 + 180, y1], fill="red")
-    draw.text((x1 + 8, max(0, y1 - 24)), f"SIMULATED: {target}", fill="white")
-    return image
-
-
 def speak_feedback_once(text: str, event_idx: int) -> None:
     safe_text = json.dumps(text)
     script = f"""
@@ -294,31 +258,38 @@ def main() -> None:
 
     st.title("Hoop Master: Basketball Throw Form Assistant (Hi-Fi Prototype)")
     st.caption(
-        "Simulation mode: camera still image capture + randomized feedback every 3 seconds for 30 seconds."
+        "Simulation mode: live video capture + randomized feedback every 3 seconds for 30 seconds."
     )
 
     st.session_state.mute_audio = st.toggle(
         "Mute audio feedback", value=st.session_state.mute_audio
     )
 
-    if st.session_state.session_active:
-        st_autorefresh(interval=THROW_INTERVAL_SECONDS * 1000, key="throw_timer")
-
-    maybe_advance_simulation()
-
-    camera_file = st.camera_input("Capture your current shooting form")
-    if camera_file is not None:
-        st.session_state.captured_image = camera_file.getvalue()
+    left_col, right_col = st.columns([1.2, 1])
+    with left_col:
+        st.subheader("Live Camera Feed")
+        rtc_ctx = webrtc_streamer(
+            key="live-preview",
+            mode=WebRtcMode.SENDRECV,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+        camera_live = bool(rtc_ctx and rtc_ctx.state.playing)
+        if camera_live:
+            st.success("Live camera is active. Perform your throws now.")
+        else:
+            st.info("Click START in the video box to enable your live camera.")
 
     control_col1, control_col2, control_col3 = st.columns(3)
     if control_col1.button("Start Session", use_container_width=True):
-        if st.session_state.captured_image is None:
-            st.warning("Please capture a form image before starting the session.")
+        if not camera_live:
+            st.warning("Enable live camera first, then start the session.")
         elif not st.session_state.session_active:
             reset_session()
             st.session_state.session_active = True
             st.session_state.session_start_ts = time.time()
             st.session_state.rng_seed = int(st.session_state.session_start_ts)
+            st.rerun()
 
     if control_col2.button("Stop Session", use_container_width=True):
         if st.session_state.session_active:
@@ -330,6 +301,11 @@ def main() -> None:
         reset_session()
 
     if st.session_state.session_active:
+        st_autorefresh(interval=THROW_INTERVAL_SECONDS * 1000, key="throw_timer")
+
+    maybe_advance_simulation()
+
+    if st.session_state.session_active:
         elapsed = time.time() - st.session_state.session_start_ts
         remaining = max(0, SESSION_DURATION_SECONDS - elapsed)
         st.info(
@@ -338,24 +314,17 @@ def main() -> None:
     elif st.session_state.session_completed:
         st.success("Session completed. Review your summary below.")
 
-    left_col, right_col = st.columns([1.2, 1])
+    latest_event = st.session_state.throw_events[-1] if st.session_state.throw_events else None
 
     with left_col:
-        st.subheader("Captured Form")
-        latest_event = (
-            st.session_state.throw_events[-1] if st.session_state.throw_events else None
-        )
-        if st.session_state.captured_image is None:
-            st.write("No captured image yet.")
-        elif latest_event is None or latest_event["target"] == "GOOD FORM":
-            st.image(st.session_state.captured_image, use_container_width=True)
-            st.caption("No highlight currently shown.")
+        st.subheader("Simulated Highlight")
+        if latest_event is None:
+            st.write("Waiting for throws...")
+        elif latest_event["target"] == "GOOD FORM":
+            st.success("No issue highlighted for this throw.")
         else:
-            highlighted = draw_target_box(
-                st.session_state.captured_image, latest_event["target"]
-            )
-            st.image(highlighted, use_container_width=True)
-            st.caption("Highlight is simulated for prototype demonstration.")
+            st.warning(f"Highlighted target area: {latest_event['target']}")
+        st.caption("Highlighting is simulated text guidance for this prototype.")
 
     with right_col:
         st.subheader("Live Feedback")
