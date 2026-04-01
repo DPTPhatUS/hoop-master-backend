@@ -12,7 +12,7 @@ from streamlit_webrtc import WebRtcMode, webrtc_streamer
 THROW_INTERVAL_SECONDS = 10
 SESSION_DURATION_SECONDS = 60
 MAX_POINTS_PER_THROW = 10
-NO_MISTAKE_WEIGHT = 0.35
+NO_MISTAKE_WEIGHT = 0.3
 
 MISTAKES = [
     {
