@@ -31,8 +31,6 @@ uv run uvicorn app:app --reload
 
 Then open http://127.0.0.1:8000/docs for interactive API docs.
 
-## API Overview
-
 ## Code Structure
 
 - `app.py`: thin ASGI entrypoint (`from api import app`).
@@ -40,6 +38,8 @@ Then open http://127.0.0.1:8000/docs for interactive API docs.
 - `manager.py`: in-memory session registry and lookup/create helpers.
 - `models.py`: Pydantic request models and dataclasses for session state/events.
 - `simulation.py`: simulation runtime logic, outcomes, scoring, snapshots, and summaries.
+
+## API Overview
 
 ### Health
 
