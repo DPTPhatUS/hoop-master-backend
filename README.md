@@ -1,25 +1,23 @@
-# Hoop Master (Hi-Fi Prototype)
+# Hoop Master Backend Simulation
 
-This project simulates a basketball throw form assistant for user-system interaction testing.
-It is intentionally a prototype workflow (not real pose estimation).
+This project now runs as a backend-only simulation service.
+It accepts camera frames from any frontend and emits simulated basketball throw feedback events.
 
-## What It Simulates
+The simulation behavior is still prototype logic (not real pose estimation): outcomes are randomized from predefined mistake patterns.
 
-1. Live camera capture of user shooting form (video stream).
-2. Predefined common shooting-form mistakes.
-3. Live processing simulation every 3 seconds with randomized outcomes:
-	- A detected mistake, or
-	- No mistake detected.
-4. Audio feedback via text-to-speech (browser speech synthesis).
-5. Per-throw points for each randomized outcome.
-6. End-of-session summary after 30 seconds with throw counts and statistics.
+## What The Backend Provides
+
+1. Session lifecycle APIs (create, start, stop, reset).
+2. Timed throw simulation events (default every 10 seconds for a 60-second session).
+3. Per-throw scoring and feedback text.
+4. Session summary statistics.
+5. Camera ingest endpoint (WebSocket binary frames).
 
 ## Tech Stack
 
 - Python 3.11+
-- Streamlit
-- streamlit-autorefresh
-- streamlit-webrtc
+- FastAPI
+- Uvicorn
 - uv for package management and execution
 
 ## Run With uv
@@ -28,26 +26,50 @@ From the project root:
 
 ```bash
 uv sync
-uv run streamlit run app.py
+uv run uvicorn app:app --reload
 ```
 
-Then open the local Streamlit URL in your browser.
+Then open http://127.0.0.1:8000/docs for interactive API docs.
 
-## Demo Flow
+## API Overview
 
-1. Turn on webcam live stream by clicking START in the video panel.
-2. Click Start Session.
-3. The app creates one simulated throw event every 3 seconds while you perform throws.
-4. Each event shows:
-	- Detected issue (or no issue),
-	- Coaching feedback text,
-	- Simulated highlighted target area,
-	- Points for that throw.
-5. Audio feedback is spoken for each new throw unless Mute is enabled.
-6. At 30 seconds, session ends and summary metrics are shown.
+### Health
+
+- `GET /health`
+
+### Session REST Endpoints
+
+- `POST /sessions`
+- `GET /sessions/{session_id}`
+- `POST /sessions/{session_id}/start`
+- `POST /sessions/{session_id}/stop`
+- `POST /sessions/{session_id}/reset`
+- `GET /sessions/{session_id}/summary`
+
+### WebSocket Endpoints
+
+- `WS /ws/sessions/{session_id}/events`
+	- Server pushes JSON messages:
+		- `session_state` (on connect)
+		- `session_started`
+		- `throw_event`
+		- `session_completed`
+		- `session_stopped`
+		- `session_reset`
+- `WS /ws/sessions/{session_id}/video`
+	- Frontend sends binary frame blobs (JPEG/PNG bytes).
+	- Backend tracks camera activity metadata only.
+
+## Minimal Frontend Flow
+
+1. `POST /sessions` to create a session.
+2. Connect to `WS /ws/sessions/{session_id}/events` to receive feedback.
+3. Connect to `WS /ws/sessions/{session_id}/video` and stream frames.
+4. `POST /sessions/{session_id}/start` to begin simulation.
+5. Render feedback from incoming `throw_event` JSON messages.
 
 ## Notes
 
-- Highlighted mistake regions are simulated guidance and not computer vision output.
-- Browser permission is required for camera access.
-- Browser support is required for the Web Speech API used for text-to-speech.
+- Video frames do not currently influence simulation outcomes.
+- This service stores sessions in memory only.
+- Browser TTS and UI rendering belong to the frontend.

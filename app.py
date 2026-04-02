@@ -1,18 +1,21 @@
-import json
+import asyncio
 import random
 import time
-from urllib.parse import quote
 from collections import Counter
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from typing import Any
+from uuid import uuid4
 
-import streamlit as st
-from streamlit_autorefresh import st_autorefresh
-from streamlit_webrtc import WebRtcMode, webrtc_streamer
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-THROW_INTERVAL_SECONDS = 10
-SESSION_DURATION_SECONDS = 60
-MAX_POINTS_PER_THROW = 10
-NO_MISTAKE_WEIGHT = 0.3
+DEFAULT_THROW_INTERVAL_SECONDS = 10
+DEFAULT_SESSION_DURATION_SECONDS = 60
+DEFAULT_MAX_POINTS_PER_THROW = 10
+DEFAULT_NO_MISTAKE_WEIGHT = 0.3
+CAMERA_ACTIVE_WINDOW_SECONDS = 3.0
 
 MISTAKES = [
     {
@@ -97,298 +100,398 @@ MISTAKES = [
     },
 ]
 
-def init_state() -> None:
-    defaults = {
-        "session_active": False,
-        "session_completed": False,
-        "session_start_ts": None,
-        "session_end_ts": None,
-        "next_throw_at": THROW_INTERVAL_SECONDS,
-        "throw_events": [],
-        "total_points": 0,
-        "rng_seed": None,
-        "last_spoken_event_idx": 0,
-        "mute_audio": False,
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+
+class SessionConfig(BaseModel):
+    throw_interval_seconds: int = Field(default=DEFAULT_THROW_INTERVAL_SECONDS, ge=1)
+    session_duration_seconds: int = Field(default=DEFAULT_SESSION_DURATION_SECONDS, ge=1)
+    max_points_per_throw: int = Field(default=DEFAULT_MAX_POINTS_PER_THROW, ge=1)
+    no_mistake_weight: float = Field(default=DEFAULT_NO_MISTAKE_WEIGHT, ge=0.0, le=1.0)
 
 
-def reset_session() -> None:
-    st.session_state.session_active = False
-    st.session_state.session_completed = False
-    st.session_state.session_start_ts = None
-    st.session_state.session_end_ts = None
-    st.session_state.next_throw_at = THROW_INTERVAL_SECONDS
-    st.session_state.throw_events = []
-    st.session_state.total_points = 0
-    st.session_state.rng_seed = None
-    st.session_state.last_spoken_event_idx = 0
+class CreateSessionRequest(BaseModel):
+    config: SessionConfig | None = None
 
 
-def choose_outcome(throw_idx: int) -> dict:
-    rng = random.Random(st.session_state.rng_seed + (throw_idx * 1009))
-    if rng.random() < NO_MISTAKE_WEIGHT:
+@dataclass
+class ThrowEvent:
+    idx: int
+    timestamp: str
+    elapsed_s: float
+    mistake_id: str | None
+    mistake_title: str
+    feedback: str
+    target: str
+    points: int
+
+
+@dataclass
+class SessionState:
+    session_active: bool = False
+    session_completed: bool = False
+    session_start_ts: float | None = None
+    session_end_ts: float | None = None
+    next_throw_at: float = DEFAULT_THROW_INTERVAL_SECONDS
+    throw_events: list[ThrowEvent] = field(default_factory=list)
+    total_points: int = 0
+    rng_seed: int | None = None
+
+
+class SessionRuntime:
+    def __init__(self, session_id: str, config: SessionConfig):
+        self.session_id = session_id
+        self.config = config
+        self.state = SessionState(next_throw_at=config.throw_interval_seconds)
+        self.lock = asyncio.Lock()
+        self.event_clients: set[WebSocket] = set()
+        self.runner_task: asyncio.Task[None] | None = None
+        self.last_frame_ts: float | None = None
+        self.last_frame_size: int | None = None
+
+    def reset(self) -> None:
+        self.state = SessionState(next_throw_at=self.config.throw_interval_seconds)
+
+    def start(self, now: float) -> None:
+        self.reset()
+        self.state.session_active = True
+        self.state.session_start_ts = now
+        self.state.rng_seed = int(now)
+
+    def stop(self, now: float) -> None:
+        self.state.session_active = False
+        self.state.session_completed = True
+        self.state.session_end_ts = now
+
+    def choose_outcome(self, throw_idx: int) -> dict[str, Any]:
+        if self.state.rng_seed is None:
+            raise RuntimeError("Session seed is missing")
+
+        rng = random.Random(self.state.rng_seed + (throw_idx * 1009))
+        if rng.random() < self.config.no_mistake_weight:
+            return {
+                "mistake_id": None,
+                "mistake_title": "No mistake detected",
+                "feedback": "Great form. Keep this same rhythm and follow-through.",
+                "target": "GOOD FORM",
+                "penalty": 0,
+            }
+
+        weights = [mistake["weight"] for mistake in MISTAKES]
+        choice = rng.choices(MISTAKES, weights=weights, k=1)[0]
         return {
-            "mistake_id": None,
-            "mistake_title": "No mistake detected",
-            "feedback": "Great form. Keep this same rhythm and follow-through.",
-            "target": "GOOD FORM",
-            "penalty": 0,
+            "mistake_id": choice["id"],
+            "mistake_title": choice["title"],
+            "feedback": choice["feedback"],
+            "target": choice["target"],
+            "penalty": choice["penalty"],
         }
 
-    weights = [mistake["weight"] for mistake in MISTAKES]
-    choice = rng.choices(MISTAKES, weights=weights, k=1)[0]
-    return {
-        "mistake_id": choice["id"],
-        "mistake_title": choice["title"],
-        "feedback": choice["feedback"],
-        "target": choice["target"],
-        "penalty": choice["penalty"],
-    }
-
-
-def add_throw_event(elapsed_seconds: float) -> None:
-    throw_idx = len(st.session_state.throw_events) + 1
-    outcome = choose_outcome(throw_idx)
-    points = max(0, MAX_POINTS_PER_THROW - outcome["penalty"])
-    event = {
-        "idx": throw_idx,
-        "timestamp": datetime.now().strftime("%H:%M:%S"),
-        "elapsed_s": round(elapsed_seconds, 1),
-        "mistake_id": outcome["mistake_id"],
-        "mistake_title": outcome["mistake_title"],
-        "feedback": outcome["feedback"],
-        "target": outcome["target"],
-        "points": points,
-    }
-    st.session_state.throw_events.append(event)
-    st.session_state.total_points += points
-
-
-def maybe_advance_simulation() -> None:
-    if not st.session_state.session_active:
-        return
-
-    now = time.time()
-    elapsed_seconds = now - st.session_state.session_start_ts
-
-    while (
-        st.session_state.next_throw_at <= SESSION_DURATION_SECONDS
-        and elapsed_seconds >= st.session_state.next_throw_at
-    ):
-        add_throw_event(st.session_state.next_throw_at)
-        st.session_state.next_throw_at += THROW_INTERVAL_SECONDS
-
-    if elapsed_seconds >= SESSION_DURATION_SECONDS:
-        st.session_state.session_active = False
-        st.session_state.session_completed = True
-        st.session_state.session_end_ts = now
-
-
-def speak_feedback_once(text: str, event_idx: int) -> None:
-    safe_text = json.dumps(text)
-    html = f"""
-    <html><body>
-    <script>
-    const text = {safe_text};
-    if ('speechSynthesis' in window) {{
-        window.speechSynthesis.cancel();
-        const utter = new SpeechSynthesisUtterance(text);
-        utter.lang = 'en-US';
-        utter.rate = 1.0;
-        utter.pitch = 1.0;
-        window.speechSynthesis.speak(utter);
-    }}
-    </script>
-    <!-- event:{event_idx} -->
-    </body></html>
-    """
-    # Use iframe with a tiny positive height so script executes on every new event.
-    data_url = f"data:text/html;charset=utf-8,{quote(html)}"
-    st.iframe(data_url, height=1, width="content")
-    st.session_state.last_spoken_event_idx = event_idx
-
-
-def render_summary() -> None:
-    events = st.session_state.throw_events
-    if not events:
-        st.info("No throws recorded in this session.")
-        return
-
-    points = [event["points"] for event in events]
-    no_mistake_count = sum(1 for event in events if event["mistake_id"] is None)
-    mistake_counter = Counter(
-        event["mistake_title"] for event in events if event["mistake_id"] is not None
-    )
-    most_common = mistake_counter.most_common(1)
-
-    st.subheader("Session Summary")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Throws", len(events))
-    col2.metric("Total Points", st.session_state.total_points)
-    col3.metric("Average Points", f"{st.session_state.total_points / len(events):.2f}")
-
-    col4, col5, col6 = st.columns(3)
-    col4.metric("Best Throw", max(points))
-    col5.metric("Worst Throw", min(points))
-    col6.metric("No-Mistake Rate", f"{(no_mistake_count / len(events)) * 100:.1f}%")
-
-    if most_common:
-        st.write(
-            f"Most frequent mistake: **{most_common[0][0]}** ({most_common[0][1]} times)"
+    def add_throw_event(self, elapsed_seconds: float) -> ThrowEvent:
+        throw_idx = len(self.state.throw_events) + 1
+        outcome = self.choose_outcome(throw_idx)
+        points = max(0, self.config.max_points_per_throw - outcome["penalty"])
+        event = ThrowEvent(
+            idx=throw_idx,
+            timestamp=datetime.now().strftime("%H:%M:%S"),
+            elapsed_s=round(elapsed_seconds, 1),
+            mistake_id=outcome["mistake_id"],
+            mistake_title=outcome["mistake_title"],
+            feedback=outcome["feedback"],
+            target=outcome["target"],
+            points=points,
         )
-    else:
-        st.write("Most frequent mistake: none")
+        self.state.throw_events.append(event)
+        self.state.total_points += points
+        return event
 
-    st.dataframe(
-        [
-            {
-                "Throw": event["idx"],
-                "Time": event["timestamp"],
-                "Detected": event["mistake_title"],
-                "Target": event["target"],
-                "Points": event["points"],
+    def advance(self, now: float) -> tuple[list[ThrowEvent], bool]:
+        if not self.state.session_active or self.state.session_start_ts is None:
+            return [], False
+
+        elapsed_seconds = now - self.state.session_start_ts
+        new_events: list[ThrowEvent] = []
+
+        while (
+            self.state.next_throw_at <= self.config.session_duration_seconds
+            and elapsed_seconds >= self.state.next_throw_at
+        ):
+            new_events.append(self.add_throw_event(self.state.next_throw_at))
+            self.state.next_throw_at += self.config.throw_interval_seconds
+
+        completed_now = False
+        if elapsed_seconds >= self.config.session_duration_seconds:
+            self.state.session_active = False
+            self.state.session_completed = True
+            self.state.session_end_ts = now
+            completed_now = True
+
+        return new_events, completed_now
+
+    def snapshot(self) -> dict[str, Any]:
+        now = time.time()
+        remaining = 0.0
+        if self.state.session_active and self.state.session_start_ts is not None:
+            elapsed = now - self.state.session_start_ts
+            remaining = max(0.0, self.config.session_duration_seconds - elapsed)
+
+        camera_connected = (
+            self.last_frame_ts is not None and (now - self.last_frame_ts) <= CAMERA_ACTIVE_WINDOW_SECONDS
+        )
+
+        return {
+            "session_id": self.session_id,
+            "config": self.config.model_dump(),
+            "state": {
+                "session_active": self.state.session_active,
+                "session_completed": self.state.session_completed,
+                "session_start_ts": self.state.session_start_ts,
+                "session_end_ts": self.state.session_end_ts,
+                "next_throw_at": self.state.next_throw_at,
+                "remaining_seconds": round(remaining, 2),
+                "throw_events": [asdict(event) for event in self.state.throw_events],
+                "total_points": self.state.total_points,
+                "throws": len(self.state.throw_events),
+            },
+            "camera": {
+                "connected": camera_connected,
+                "last_frame_ts": self.last_frame_ts,
+                "last_frame_size": self.last_frame_size,
+            },
+        }
+
+    def summary(self) -> dict[str, Any]:
+        events = self.state.throw_events
+        if not events:
+            return {
+                "session_id": self.session_id,
+                "total_throws": 0,
+                "total_points": 0,
+                "average_points": 0.0,
+                "best_throw": 0,
+                "worst_throw": 0,
+                "no_mistake_rate": 0.0,
+                "most_frequent_mistake": None,
             }
-            for event in events
-        ],
-        width="stretch",
-        hide_index=True,
-    )
 
-
-def main() -> None:
-    st.set_page_config(page_title="Hoop Master Prototype", layout="wide")
-    init_state()
-
-    st.title("Hoop Master: Basketball Throw Form Assistant (Hi-Fi Prototype)")
-    st.caption(
-        f"Simulation mode: live video capture + randomized feedback every {THROW_INTERVAL_SECONDS} seconds for {SESSION_DURATION_SECONDS} seconds."
-    )
-
-    st.session_state.mute_audio = st.toggle(
-        "Mute audio feedback", value=st.session_state.mute_audio
-    )
-
-    left_col, right_col = st.columns([1.2, 1])
-    with left_col:
-        st.subheader("Live Camera Feed")
-        rtc_ctx = webrtc_streamer(
-            key="live-preview",
-            mode=WebRtcMode.SENDRECV,
-            media_stream_constraints={"video": True, "audio": False},
-            async_processing=True,
+        points = [event.points for event in events]
+        no_mistake_count = sum(1 for event in events if event.mistake_id is None)
+        mistake_counter = Counter(
+            event.mistake_title for event in events if event.mistake_id is not None
         )
-        camera_live = bool(rtc_ctx and rtc_ctx.state.playing)
-        if camera_live:
-            st.success("Live camera is active. Perform your throws now.")
-        else:
-            st.info("Click START in the video box to enable your live camera.")
+        most_common = mistake_counter.most_common(1)
 
-    control_col1, control_col2, control_col3 = st.columns(3)
-    if control_col1.button("Start Session", width="stretch"):
-        if not camera_live:
-            st.warning("Enable live camera first, then start the session.")
-        elif not st.session_state.session_active:
-            reset_session()
-            st.session_state.session_active = True
-            st.session_state.session_start_ts = time.time()
-            st.session_state.rng_seed = int(st.session_state.session_start_ts)
-            st.rerun()
+        return {
+            "session_id": self.session_id,
+            "total_throws": len(events),
+            "total_points": self.state.total_points,
+            "average_points": round(self.state.total_points / len(events), 2),
+            "best_throw": max(points),
+            "worst_throw": min(points),
+            "no_mistake_rate": round((no_mistake_count / len(events)) * 100, 1),
+            "most_frequent_mistake": {
+                "title": most_common[0][0],
+                "count": most_common[0][1],
+            }
+            if most_common
+            else None,
+        }
 
-    if control_col2.button("Stop Session", width="stretch"):
-        if st.session_state.session_active:
-            st.session_state.session_active = False
-            st.session_state.session_completed = True
-            st.session_state.session_end_ts = time.time()
 
-    if control_col3.button("Reset", width="stretch"):
-        reset_session()
+class SessionManager:
+    def __init__(self) -> None:
+        self.sessions: dict[str, SessionRuntime] = {}
+        self._lock = asyncio.Lock()
 
-    if st.session_state.session_active:
-        st_autorefresh(interval=THROW_INTERVAL_SECONDS * 1000, key="throw_timer")
+    async def create_session(self, config: SessionConfig | None = None) -> SessionRuntime:
+        session_id = uuid4().hex
+        runtime = SessionRuntime(session_id=session_id, config=config or SessionConfig())
+        async with self._lock:
+            self.sessions[session_id] = runtime
+        return runtime
 
-    maybe_advance_simulation()
+    async def get_session(self, session_id: str) -> SessionRuntime:
+        runtime = self.sessions.get(session_id)
+        if runtime is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return runtime
 
-    if st.session_state.session_active:
-        elapsed = time.time() - st.session_state.session_start_ts
-        remaining = max(0, SESSION_DURATION_SECONDS - elapsed)
-        st.info(
-            f"Session running: throw every {THROW_INTERVAL_SECONDS}s | Remaining time: {remaining:.1f}s"
-        )
-    elif st.session_state.session_completed:
-        st.success("Session completed. Review your summary below.")
 
-    latest_event = st.session_state.throw_events[-1] if st.session_state.throw_events else None
+manager = SessionManager()
+app = FastAPI(title="Hoop Master Backend", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    with left_col:
-        st.subheader("Simulated Highlight")
-        if latest_event is None:
-            st.write("Waiting for throws...")
-        elif latest_event["target"] == "GOOD FORM":
-            st.success("No issue highlighted for this throw.")
-        else:
-            st.warning(f"Highlighted target area: {latest_event['target']}")
-        st.caption("Highlighting is simulated text guidance for this prototype.")
 
-    with right_col:
-        st.subheader("Live Feedback")
-        if latest_event is None:
-            st.write("Waiting for throws...")
-        else:
-            if latest_event["mistake_id"] is None:
-                st.success(latest_event["feedback"])
-            else:
-                st.warning(f"{latest_event['mistake_title']}: {latest_event['feedback']}")
-            st.write(f"Target area: **{latest_event['target']}**")
-            st.write(f"Points this throw: **{latest_event['points']} / {MAX_POINTS_PER_THROW}**")
+async def broadcast_message(runtime: SessionRuntime, payload: dict[str, Any]) -> None:
+    stale_clients: list[WebSocket] = []
+    for client in runtime.event_clients:
+        try:
+            await client.send_json(payload)
+        except RuntimeError:
+            stale_clients.append(client)
+    for client in stale_clients:
+        runtime.event_clients.discard(client)
 
-        throws = len(st.session_state.throw_events)
-        avg_points = (
-            st.session_state.total_points / throws if throws > 0 else 0
-        )
-        no_mistake_count = sum(
-            1 for event in st.session_state.throw_events if event["mistake_id"] is None
-        )
 
-        st.subheader("Running Stats")
-        stat_col1, stat_col2 = st.columns(2)
-        stat_col1.metric("Throws", throws)
-        stat_col2.metric("Total Points", st.session_state.total_points)
+async def run_session(runtime: SessionRuntime) -> None:
+    try:
+        while True:
+            await asyncio.sleep(0.25)
 
-        stat_col3, stat_col4 = st.columns(2)
-        stat_col3.metric("Average", f"{avg_points:.2f}")
-        stat_col4.metric(
-            "No-Mistake Rate",
-            f"{(no_mistake_count / throws) * 100:.1f}%" if throws > 0 else "0.0%",
-        )
+            async with runtime.lock:
+                if not runtime.state.session_active:
+                    break
+                events, completed_now = runtime.advance(time.time())
 
-        if throws > 0:
-            st.write("Recent Throws")
-            st.dataframe(
-                [
+            for event in events:
+                await broadcast_message(
+                    runtime,
                     {
-                        "Throw": event["idx"],
-                        "Detected": event["mistake_title"],
-                        "Points": event["points"],
-                    }
-                    for event in st.session_state.throw_events[-5:]
-                ],
-                hide_index=True,
-                width="stretch",
+                        "type": "throw_event",
+                        "session_id": runtime.session_id,
+                        "data": asdict(event),
+                    },
+                )
+
+            if completed_now:
+                await broadcast_message(
+                    runtime,
+                    {
+                        "type": "session_completed",
+                        "session_id": runtime.session_id,
+                        "summary": runtime.summary(),
+                    },
+                )
+                break
+    finally:
+        runtime.runner_task = None
+
+
+@app.get("/health")
+async def healthcheck() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/sessions")
+async def create_session(payload: CreateSessionRequest | None = None) -> dict[str, Any]:
+    config = payload.config if payload else None
+    runtime = await manager.create_session(config=config)
+    return runtime.snapshot()
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str) -> dict[str, Any]:
+    runtime = await manager.get_session(session_id)
+    async with runtime.lock:
+        return runtime.snapshot()
+
+
+@app.post("/sessions/{session_id}/start")
+async def start_session(session_id: str) -> dict[str, Any]:
+    runtime = await manager.get_session(session_id)
+    async with runtime.lock:
+        runtime.start(time.time())
+        if runtime.runner_task is None or runtime.runner_task.done():
+            runtime.runner_task = asyncio.create_task(run_session(runtime))
+        snapshot = runtime.snapshot()
+
+    await broadcast_message(
+        runtime,
+        {
+            "type": "session_started",
+            "session_id": runtime.session_id,
+            "data": snapshot,
+        },
+    )
+    return snapshot
+
+
+@app.post("/sessions/{session_id}/stop")
+async def stop_session(session_id: str) -> dict[str, Any]:
+    runtime = await manager.get_session(session_id)
+    async with runtime.lock:
+        runtime.stop(time.time())
+        snapshot = runtime.snapshot()
+        summary = runtime.summary()
+
+    await broadcast_message(
+        runtime,
+        {
+            "type": "session_stopped",
+            "session_id": runtime.session_id,
+            "summary": summary,
+        },
+    )
+    return snapshot
+
+
+@app.post("/sessions/{session_id}/reset")
+async def reset_session(session_id: str) -> dict[str, Any]:
+    runtime = await manager.get_session(session_id)
+    async with runtime.lock:
+        runtime.reset()
+        snapshot = runtime.snapshot()
+
+    await broadcast_message(
+        runtime,
+        {
+            "type": "session_reset",
+            "session_id": runtime.session_id,
+            "data": snapshot,
+        },
+    )
+    return snapshot
+
+
+@app.get("/sessions/{session_id}/summary")
+async def get_session_summary(session_id: str) -> dict[str, Any]:
+    runtime = await manager.get_session(session_id)
+    async with runtime.lock:
+        return runtime.summary()
+
+
+@app.websocket("/ws/sessions/{session_id}/events")
+async def events_websocket(websocket: WebSocket, session_id: str) -> None:
+    runtime = await manager.get_session(session_id)
+    await websocket.accept()
+    runtime.event_clients.add(websocket)
+
+    try:
+        async with runtime.lock:
+            await websocket.send_json(
+                {
+                    "type": "session_state",
+                    "session_id": runtime.session_id,
+                    "data": runtime.snapshot(),
+                }
             )
 
-            latest_idx = latest_event["idx"]
-            if (
-                not st.session_state.mute_audio
-                and latest_idx > st.session_state.last_spoken_event_idx
-            ):
-                speak_feedback_once(latest_event["feedback"], latest_idx)
-
-    if st.session_state.session_completed:
-        render_summary()
+        while True:
+            await websocket.receive()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        runtime.event_clients.discard(websocket)
 
 
-if __name__ == "__main__":
-    main()
+@app.websocket("/ws/sessions/{session_id}/video")
+async def video_websocket(websocket: WebSocket, session_id: str) -> None:
+    runtime = await manager.get_session(session_id)
+    await websocket.accept()
+
+    try:
+        while True:
+            message = await websocket.receive()
+            frame = message.get("bytes")
+            if frame is None:
+                continue
+
+            async with runtime.lock:
+                runtime.last_frame_ts = time.time()
+                runtime.last_frame_size = len(frame)
+    except WebSocketDisconnect:
+        return
