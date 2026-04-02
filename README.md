@@ -33,6 +33,14 @@ Then open http://127.0.0.1:8000/docs for interactive API docs.
 
 ## API Overview
 
+## Code Structure
+
+- `app.py`: thin ASGI entrypoint (`from api import app`).
+- `api.py`: FastAPI routes, websocket handlers, and event broadcasting loop.
+- `manager.py`: in-memory session registry and lookup/create helpers.
+- `models.py`: Pydantic request models and dataclasses for session state/events.
+- `simulation.py`: simulation runtime logic, outcomes, scoring, snapshots, and summaries.
+
 ### Health
 
 - `GET /health`
