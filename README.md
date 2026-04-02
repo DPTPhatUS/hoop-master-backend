@@ -74,6 +74,9 @@ Then open http://127.0.0.1:8000/docs for interactive API docs.
 3. Connect to `WS /ws/sessions/{session_id}/video` and stream frames.
 4. `POST /sessions/{session_id}/start` to begin simulation.
 5. Render feedback from incoming `throw_event` JSON messages.
+
+## Notes
+
 - Video frames do not currently influence simulation outcomes.
 - This service stores sessions in memory only.
 - Browser TTS and UI rendering belong to the frontend.
